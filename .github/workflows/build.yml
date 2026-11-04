@@ -1,295 +1,58 @@
-name: Build TV Remote APK
+name: Build Kotlin TV Remote APK
 
 on:
   workflow_dispatch:
   push:
-    branches: [main, master]
+    branches:
+      - main
+
+permissions:
+  contents: read
 
 jobs:
   build:
+    name: Build Android TV Remote
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout this repository
         uses: actions/checkout@v4
 
-      - name: Checkout Android TV Remote source
+      - name: Download Kotlin remote project
         uses: actions/checkout@v4
         with:
-          repository: SebghatYusuf/android_remote
+          repository: theharisshah/androidremote
+          ref: main
           path: app_source
 
-      - name: Setup Java
+      - name: Install Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          cache: true
+      - name: Install Android SDK
+        uses: android-actions/setup-android@v3
 
-      - name: Patch App Link protocol
+      - name: Install SDK packages
+        run: |
+          sdkmanager "platforms;android-37.1" "build-tools;37.0.0"
+
+      - name: Run protocol tests
         working-directory: app_source
         run: |
-          python3 - <<'PY'
-          import sys
-          from pathlib import Path
+          chmod +x gradlew
+          ./gradlew --no-daemon :protocol:test
 
-          def replace_once(source, old, new, label):
-              count = source.count(old)
-              if count != 1:
-                  sys.exit(
-                      f"{label}: expected 1 match, found {count}"
-                  )
-              return source.replace(old, new, 1)
-
-          proto_path = Path("lib/src/proto/remote.pb.dart")
-          client_path = Path("lib/src/services/tv_remote_client.dart")
-          provider_path = Path("lib/src/providers/remote_provider.dart")
-          ui_path = Path("lib/src/ui/tv_remote_screen.dart")
-
-          proto = proto_path.read_text()
-          client = client_path.read_text()
-          provider = provider_path.read_text()
-          ui = ui_path.read_text()
-
-          # Add App Link encoder.
-          proto = replace_once(
-              proto,
-              "  /// Parse an incoming RemoteMessage.\n"
-              "  static RemoteIncoming parse(Uint8List data) {",
-              """  /// Build RemoteAppLinkLaunchRequest (field 90).
-            static Uint8List buildAppLinkLaunch(String appLink) {
-              if (appLink.isEmpty) {
-                throw ArgumentError('App link cannot be empty');
-              }
-              return frameMessage(_bytesField(90, _strField(1, appLink)));
-            }
-
-            /// Parse an incoming RemoteMessage.
-            static RemoteIncoming parse(Uint8List data) {""",
-              "App Link encoder"
-          )
-
-          # Read RemoteConfigure.code1.
-          proto = replace_once(
-              proto,
-              """        if (field == 8) {
-                    // RemotePingRequest: parse val1 to echo back
-                    final pingVal = _firstVarintValue(data.sublist(i, i + len));
-                    i += len;
-                    return RemoteIncoming(field: 8, pingVal: pingVal);
-                  }
-                  i += len;
-                  return RemoteIncoming(field: field);""",
-              """        if (field == 1) {
-                    final code1 = _firstVarintValue(data.sublist(i, i + len));
-                    return RemoteIncoming(field: 1, code1: code1);
-                  }
-                  if (field == 8) {
-                    // RemotePingRequest: parse val1 to echo back
-                    final pingVal = _firstVarintValue(data.sublist(i, i + len));
-                    i += len;
-                    return RemoteIncoming(field: 8, pingVal: pingVal);
-                  }
-                  i += len;
-                  return RemoteIncoming(field: field);""",
-              "RemoteConfigure parser"
-          )
-
-          proto = replace_once(
-              proto,
-              """class RemoteIncoming {
-            final int field;
-            final int pingVal; // only meaningful when field == 8
-            RemoteIncoming({required this.field, this.pingVal = 0});
-          }""",
-              """class RemoteIncoming {
-            final int field;
-            final int pingVal;
-            final int code1;
-
-            RemoteIncoming({
-              required this.field,
-              this.pingVal = 0,
-              this.code1 = 0,
-            });
-          }""",
-              "RemoteIncoming fields"
-          )
-
-          # Client capability flag.
-          client = replace_once(
-              client,
-              "  bool _isConnected = false;",
-              "  bool _isConnected = false;\n  bool _supportsAppLink = false;",
-              "Client capability flag"
-          )
-
-          client = replace_once(
-              client,
-              "  Future<bool> connect(String ip, {int port = 6466}) async {\n    try {",
-              "  Future<bool> connect(String ip, {int port = 6466}) async {\n"
-              "    _supportsAppLink = false;\n    try {",
-              "Reset capability"
-          )
-
-          client = replace_once(
-              client,
-              "      case 1: // remoteConfigure – TV requests our device info, reply immediately\n"
-              "        _commandSocket!.add(RemoteMessage.buildConfigure());",
-              "      case 1: // remoteConfigure\n"
-              "        _supportsAppLink = (incoming.code1 & 512) != 0;\n"
-              "        _commandSocket!.add(RemoteMessage.buildConfigure());",
-              "RemoteConfigure feature check"
-          )
-
-          client = replace_once(
-              client,
-              "  void sendKeyPress(int code) => _sendKey(code, RemoteDirection.SHORT);",
-              """  void launchAppLink(String appLink) {
-              if (!_isConnected || _commandSocket == null) return;
-              if (!_supportsAppLink || appLink.isEmpty) return;
-
-              _commandSocket!.add(
-                RemoteMessage.buildAppLinkLaunch(appLink),
-              );
-            }
-
-            void sendKeyPress(int code) =>
-                _sendKey(code, RemoteDirection.SHORT);""",
-              "Client App Link method"
-          )
-
-          # Expose method through provider.
-          provider = replace_once(
-              provider,
-              "  void sendKeyPress(int code) => _remoteClient?.sendKeyPress(code);",
-              "  void launchAppLink(String appLink) =>\n"
-              "      _remoteClient?.launchAppLink(appLink);\n"
-              "  void sendKeyPress(int code) => _remoteClient?.sendKeyPress(code);",
-              "Provider method"
-          )
-
-          # Add YouTube button without changing existing controls.
-          ui = replace_once(
-              ui,
-              "          _Label('MEDIA'),",
-              """          _Label('APPS'),
-                    _Card(
-                      child: Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                        children: [
-                          _Btn(
-                            icon: Icons.smart_display_rounded,
-                            label: 'YOUTUBE',
-                            onTap: () => n.launchAppLink(
-                              'market://launch?id=com.google.android.youtube.tv',
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(height: 20),
-                    _Label('MEDIA'),""",
-              "YouTube button"
-          )
-
-          # Verify original buttons remain unchanged.
-          for required in (
-              "label: 'MENU',  onTap: () => n.sendKeyPress(82)",
-              "label: 'INPUT', onTap: () => n.sendKeyPress(178)",
-          ):
-              if required not in ui:
-                  sys.exit("Original button missing: " + required)
-
-          # Write only after all checks pass.
-          proto_path.write_text(proto)
-          client_path.write_text(client)
-          provider_path.write_text(provider)
-          ui_path.write_text(ui)
-
-          print("All patches applied successfully.")
-          print("MENU and INPUT key codes verified.")
-          PY
-
-      - name: Add App Link protocol tests
+      - name: Build APK
         working-directory: app_source
         run: |
-          mkdir -p test
-
-          cat > test/app_link_protocol_test.dart <<'DART'
-          import 'dart:typed_data';
-          import 'package:flutter_test/flutter_test.dart';
-          import '../lib/src/proto/remote.pb.dart';
-
-          void main() {
-            test('App Link field 90 bytes', () {
-              const link =
-                  'market://launch?id=com.google.android.youtube.tv';
-
-              final actual = RemoteMessage.buildAppLinkLaunch(link);
-
-              final actualHex = actual
-                  .map((b) => b.toRadixString(16).padLeft(2, '0'))
-                  .join();
-
-              const expectedHex =
-                  '35d205320a306d61726b65743a2f2f6c61756e63683f69643d'
-                  '636f6d2e676f6f676c652e616e64726f69642e796f7574756265'
-                  '2e7476';
-
-              expect(actualHex, expectedHex);
-              expect(actual.length, 54);
-            });
-
-            test('RemoteConfigure detects App Link bit', () {
-              final incoming = RemoteMessage.parse(
-                Uint8List.fromList([
-                  0x0a, 0x03, 0x08, 0xee, 0x04
-                ]),
-              );
-
-              expect(incoming.field, 1);
-              expect(incoming.code1, 622);
-              expect(incoming.code1 & 512, 512);
-            });
-
-            test('RemoteConfigure without App Link bit', () {
-              final incoming = RemoteMessage.parse(
-                Uint8List.fromList([
-                  0x0a, 0x02, 0x08, 0x6e
-                ]),
-              );
-
-              expect(incoming.field, 1);
-              expect(incoming.code1 & 512, 0);
-            });
-          }
-          DART
-
-      - name: Install dependencies
-        working-directory: app_source
-        run: flutter pub get
-
-      - name: Analyze Flutter project
-        working-directory: app_source
-        run: flutter analyze --no-fatal-infos --no-fatal-warnings
-
-      - name: Run tests
-        working-directory: app_source
-        run: flutter test
-
-      - name: Build Release APK
-        working-directory: app_source
-        run: flutter build apk --release --android-skip-build-dependency-validation
+          ./gradlew --no-daemon :app:assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: TV-Remote-APK
-          path: app_source/build/app/outputs/flutter-apk/app-release.apk
+          name: Kotlin-TV-Remote-APK
+          path: app_source/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+          retention-days: 14
