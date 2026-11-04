@@ -1,4 +1,3 @@
-
 name: Build TV Remote APK
 
 on:
@@ -31,6 +30,147 @@ jobs:
         with:
           channel: stable
           cache: true
+
+      - name: Add app shortcuts and system buttons
+        working-directory: app_source
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def patch(file, old, new):
+              p = Path(file)
+              text = p.read_text()
+              if text.count(old) != 1:
+                  raise SystemExit(f"Patch failed in {file}: expected exactly one match")
+              p.write_text(text.replace(old, new, 1))
+              print("Patched:", file)
+
+          patch(
+              "lib/src/proto/remote.pb.dart",
+              """  static Uint8List buildKeyInject(int keyCode, int direction) =>
+                  frameMessage(_bytesField(10, [
+                    ..._int32Field(1, keyCode),
+                    ..._int32Field(2, direction),
+                  ]));""",
+              """  static Uint8List buildKeyInject(int keyCode, int direction) =>
+                  frameMessage(_bytesField(10, [
+                    ..._int32Field(1, keyCode),
+                    ..._int32Field(2, direction),
+                  ]));
+
+              static Uint8List buildAppLinkLaunch(String appLink) =>
+                  frameMessage(_bytesField(90, _strField(1, appLink)));"""
+          )
+
+          patch(
+              "lib/src/services/tv_remote_client.dart",
+              "  void sendKeyPress(int code) => _sendKey(code, RemoteDirection.SHORT);",
+              """  void sendKeyPress(int code) => _sendKey(code, RemoteDirection.SHORT);
+
+              void launchAppLink(String appLink) {
+                if (!_isConnected || _commandSocket == null) return;
+                try {
+                  _commandSocket!.add(RemoteMessage.buildAppLinkLaunch(appLink));
+                } catch (e) {
+                  _handleDisconnection('Failed to launch app link: $e');
+                }
+              }"""
+          )
+
+          patch(
+              "lib/src/providers/remote_provider.dart",
+              "  void sendKeyPress(int code) => _remoteClient?.sendKeyPress(code);",
+              """  void sendKeyPress(int code) => _remoteClient?.sendKeyPress(code);
+
+              void launchAppLink(String appLink) =>
+                  _remoteClient?.launchAppLink(appLink);"""
+          )
+
+          media = """          _Label('MEDIA'),
+                    _Card(
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                        children: [
+                          _Btn(icon: Icons.skip_previous_rounded, label: 'PREV', onTap: () => n.sendKeyPress(88)),
+                          _Btn(icon: Icons.play_arrow_rounded,    label: 'PLAY', onTap: () => n.sendKeyPress(85)),
+                          _Btn(icon: Icons.stop_rounded,          label: 'STOP', onTap: () => n.sendKeyPress(86)),
+                          _Btn(icon: Icons.skip_next_rounded,     label: 'NEXT', onTap: () => n.sendKeyPress(87)),
+                        ],
+                      ),
+                    ),
+          """
+
+          additions = """          _Label('MEDIA'),
+                    _Card(
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                        children: [
+                          _Btn(icon: Icons.skip_previous_rounded, label: 'PREV', onTap: () => n.sendKeyPress(88)),
+                          _Btn(icon: Icons.play_arrow_rounded,    label: 'PLAY', onTap: () => n.sendKeyPress(85)),
+                          _Btn(icon: Icons.stop_rounded,          label: 'STOP', onTap: () => n.sendKeyPress(86)),
+                          _Btn(icon: Icons.skip_next_rounded,     label: 'NEXT', onTap: () => n.sendKeyPress(87)),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+                    _Label('APPS'),
+                    _Card(
+                      child: Wrap(
+                        alignment: WrapAlignment.spaceEvenly,
+                        spacing: 12,
+                        runSpacing: 16,
+                        children: [
+                          _Btn(
+                            icon: Icons.smart_display_rounded,
+                            label: 'YOUTUBE',
+                            onTap: () => n.launchAppLink('market://launch?id=com.google.android.youtube.tv'),
+                          ),
+                          _Btn(
+                            icon: Icons.home_work_rounded,
+                            label: 'F LAUNCHER',
+                            onTap: () => n.launchAppLink('market://launch?id=me.efesser.flauncher'),
+                          ),
+                          _Btn(
+                            icon: Icons.shop_rounded,
+                            label: 'PLAY STORE',
+                            onTap: () => n.launchAppLink('market://launch?id=com.android.vending'),
+                          ),
+                          _Btn(
+                            icon: Icons.folder_rounded,
+                            label: 'FILE MANAGER +',
+                            onTap: () => n.launchAppLink('market://launch?id=com.alphainventor.filemanager'),
+                          ),
+                          _Btn(
+                            icon: Icons.build_rounded,
+                            label: 'ADB TV',
+                            onTap: () => n.launchAppLink('market://launch?id=com.cybercat.adbappcontrol.tv'),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+                    _Label('DEVICE'),
+                    _Card(
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                        children: [
+                          _Btn(
+                            icon: Icons.settings_rounded,
+                            label: 'SETTINGS',
+                            onTap: () => n.sendKeyPress(176),
+                          ),
+                          _Btn(
+                            icon: Icons.power_settings_new_rounded,
+                            label: 'POWER',
+                            onTap: () => n.sendKeyPress(26),
+                          ),
+                        ],
+                      ),
+                    ),
+          """
+
+          patch("lib/src/ui/tv_remote_screen.dart", media, additions)
+          PY
 
       - name: Install dependencies
         working-directory: app_source
