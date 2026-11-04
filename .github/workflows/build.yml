@@ -37,62 +37,110 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
-          def insert_after(file, anchor, addition):
+          def patch_regex(file, pattern, addition, description):
               p = Path(file)
               content = p.read_text()
-              if content.count(anchor) != 1:
+
+              updated, count = re.subn(
+                  pattern,
+                  lambda m: m.group(0) + addition,
+                  content,
+                  count=1,
+                  flags=re.MULTILINE | re.DOTALL
+              )
+
+              if count != 1:
                   raise SystemExit(
-                      f"ERROR: Anchor not found exactly once in {file}"
+                      f"PATCH ERROR in {file}: {description} "
+                      f"matched {count} times"
                   )
-              p.write_text(content.replace(anchor, anchor + addition, 1))
-              print("Updated:", file)
 
-          proto_anchor = """  static Uint8List buildKeyInject(int keyCode, int direction) =>
-              frameMessage(_bytesField(10, [
-                ..._int32Field(1, keyCode),
-                ..._int32Field(2, direction),
-              ]));"""
+              p.write_text(updated)
+              print("Patched:", description)
 
-          insert_after(
-              "lib/src/proto/remote.pb.dart",
-              proto_anchor,
-              """
+          # 1. Add app launch message to protocol
+          proto_pattern = (
+              r"  static Uint8List buildKeyInject\(int keyCode, int direction\) =>"
+              r"\s*frameMessage\(_bytesField\(10, \["
+              r"\s*\.\.\._int32Field\(1, keyCode\),"
+              r"\s*\.\.\._int32Field\(2, direction\),"
+              r"\s*\]\)\);"
+          )
+
+          proto_addition = """
 
             static Uint8List buildAppLinkLaunch(String appLink) =>
-                frameMessage(_bytesField(90, _strField(1, appLink)));"""
+                frameMessage(_bytesField(90, _strField(1, appLink)));
+          """
+
+          patch_regex(
+              "lib/src/proto/remote.pb.dart",
+              proto_pattern,
+              proto_addition,
+              "buildAppLinkLaunch"
           )
 
-          insert_after(
+          # 2. Add launch method to TV remote client
+          client_anchor = (
+              r"  void sendKeyPress\(int code\) => "
+              r"_sendKey\(code, RemoteDirection\.SHORT\);"
+          )
+
+          client_addition = """
+
+            void launchAppLink(String appLink) {
+              if (!_isConnected || _commandSocket == null) return;
+              try {
+                _commandSocket!.add(
+                  RemoteMessage.buildAppLinkLaunch(appLink)
+                );
+              } catch (e) {
+                _handleDisconnection('Failed to launch app link: $e');
+              }
+            }
+          """
+
+          patch_regex(
               "lib/src/services/tv_remote_client.dart",
-              "  void sendKeyPress(int code) => _sendKey(code, RemoteDirection.SHORT);",
-              """
-
-              void launchAppLink(String appLink) {
-                if (!_isConnected || _commandSocket == null) return;
-                try {
-                  _commandSocket!.add(RemoteMessage.buildAppLinkLaunch(appLink));
-                } catch (e) {
-                  _handleDisconnection('Failed to launch app link: $e');
-                }
-              }"""
+              client_anchor,
+              client_addition,
+              "TVRemoteClient.launchAppLink"
           )
 
-          insert_after(
+          # 3. Add launch method to provider
+          provider_anchor = (
+              r"  void sendKeyPress\(int code\) => "
+              r"_remoteClient\?\.sendKeyPress\(code\);"
+          )
+
+          provider_addition = """
+
+            void launchAppLink(String appLink) =>
+                _remoteClient?.launchAppLink(appLink);
+          """
+
+          patch_regex(
               "lib/src/providers/remote_provider.dart",
-              "  void sendKeyPress(int code) => _remoteClient?.sendKeyPress(code);",
-              """
-
-              void launchAppLink(String appLink) =>
-                  _remoteClient?.launchAppLink(appLink);"""
+              provider_anchor,
+              provider_addition,
+              "RemoteNotifier.launchAppLink"
           )
 
-          ui_anchor = """                _Btn(icon: Icons.skip_next_rounded,     label: 'NEXT', onTap: () => n.sendKeyPress(87)),
-                        ],
-                      ),
-                    ),"""
+          # 4. Add app shortcuts and device buttons after MEDIA section
+          ui_pattern = (
+              r"          _Label\('MEDIA'\),"
+              r".*?"
+              r"                _Btn\(icon: Icons\.skip_next_rounded,"
+              r".*?"
+              r"              \],\n"
+              r"            \),\n"
+              r"          \),"
+          )
 
           ui_addition = """
+
                     const SizedBox(height: 20),
                     _Label('APPS'),
                     _Card(
@@ -104,27 +152,37 @@ jobs:
                           _Btn(
                             icon: Icons.smart_display_rounded,
                             label: 'YOUTUBE',
-                            onTap: () => n.launchAppLink('market://launch?id=com.google.android.youtube.tv'),
+                            onTap: () => n.launchAppLink(
+                              'market://launch?id=com.google.android.youtube.tv',
+                            ),
                           ),
                           _Btn(
                             icon: Icons.home_work_rounded,
                             label: 'F LAUNCHER',
-                            onTap: () => n.launchAppLink('market://launch?id=me.efesser.flauncher'),
+                            onTap: () => n.launchAppLink(
+                              'market://launch?id=me.efesser.flauncher',
+                            ),
                           ),
                           _Btn(
                             icon: Icons.shop_rounded,
                             label: 'PLAY STORE',
-                            onTap: () => n.launchAppLink('market://launch?id=com.android.vending'),
+                            onTap: () => n.launchAppLink(
+                              'market://launch?id=com.android.vending',
+                            ),
                           ),
                           _Btn(
                             icon: Icons.folder_rounded,
                             label: 'FILE MANAGER +',
-                            onTap: () => n.launchAppLink('market://launch?id=com.alphainventor.filemanager'),
+                            onTap: () => n.launchAppLink(
+                              'market://launch?id=com.alphainventor.filemanager',
+                            ),
                           ),
                           _Btn(
                             icon: Icons.build_rounded,
                             label: 'ADB TV',
-                            onTap: () => n.launchAppLink('market://launch?id=com.cybercat.adbappcontrol.tv'),
+                            onTap: () => n.launchAppLink(
+                              'market://launch?id=com.cybercat.adbappcontrol.tv',
+                            ),
                           ),
                         ],
                       ),
@@ -149,11 +207,14 @@ jobs:
                       ),
                     ),"""
 
-          insert_after(
+          patch_regex(
               "lib/src/ui/tv_remote_screen.dart",
-              ui_anchor,
-              ui_addition
+              ui_pattern,
+              ui_addition,
+              "App shortcuts and device buttons"
           )
+
+          print("All modifications completed successfully.")
           PY
 
       - name: Install dependencies
