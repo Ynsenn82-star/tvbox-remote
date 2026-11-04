@@ -1,3 +1,4 @@
+
 name: Build TV Remote APK
 
 on:
@@ -31,41 +32,41 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Add app shortcuts and system buttons
+      - name: Modify TV Remote
         working-directory: app_source
         run: |
           python3 - <<'PY'
           from pathlib import Path
 
-          def patch(file, old, new):
+          def insert_after(file, anchor, addition):
               p = Path(file)
-              text = p.read_text()
-              if text.count(old) != 1:
-                  raise SystemExit(f"Patch failed in {file}: expected exactly one match")
-              p.write_text(text.replace(old, new, 1))
-              print("Patched:", file)
+              content = p.read_text()
+              if content.count(anchor) != 1:
+                  raise SystemExit(
+                      f"ERROR: Anchor not found exactly once in {file}"
+                  )
+              p.write_text(content.replace(anchor, anchor + addition, 1))
+              print("Updated:", file)
 
-          patch(
+          proto_anchor = """  static Uint8List buildKeyInject(int keyCode, int direction) =>
+              frameMessage(_bytesField(10, [
+                ..._int32Field(1, keyCode),
+                ..._int32Field(2, direction),
+              ]));"""
+
+          insert_after(
               "lib/src/proto/remote.pb.dart",
-              """  static Uint8List buildKeyInject(int keyCode, int direction) =>
-                  frameMessage(_bytesField(10, [
-                    ..._int32Field(1, keyCode),
-                    ..._int32Field(2, direction),
-                  ]));""",
-              """  static Uint8List buildKeyInject(int keyCode, int direction) =>
-                  frameMessage(_bytesField(10, [
-                    ..._int32Field(1, keyCode),
-                    ..._int32Field(2, direction),
-                  ]));
+              proto_anchor,
+              """
 
-              static Uint8List buildAppLinkLaunch(String appLink) =>
-                  frameMessage(_bytesField(90, _strField(1, appLink)));"""
+            static Uint8List buildAppLinkLaunch(String appLink) =>
+                frameMessage(_bytesField(90, _strField(1, appLink)));"""
           )
 
-          patch(
+          insert_after(
               "lib/src/services/tv_remote_client.dart",
               "  void sendKeyPress(int code) => _sendKey(code, RemoteDirection.SHORT);",
-              """  void sendKeyPress(int code) => _sendKey(code, RemoteDirection.SHORT);
+              """
 
               void launchAppLink(String appLink) {
                 if (!_isConnected || _commandSocket == null) return;
@@ -77,41 +78,21 @@ jobs:
               }"""
           )
 
-          patch(
+          insert_after(
               "lib/src/providers/remote_provider.dart",
               "  void sendKeyPress(int code) => _remoteClient?.sendKeyPress(code);",
-              """  void sendKeyPress(int code) => _remoteClient?.sendKeyPress(code);
+              """
 
               void launchAppLink(String appLink) =>
                   _remoteClient?.launchAppLink(appLink);"""
           )
 
-          media = """          _Label('MEDIA'),
-                    _Card(
-                      child: Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                        children: [
-                          _Btn(icon: Icons.skip_previous_rounded, label: 'PREV', onTap: () => n.sendKeyPress(88)),
-                          _Btn(icon: Icons.play_arrow_rounded,    label: 'PLAY', onTap: () => n.sendKeyPress(85)),
-                          _Btn(icon: Icons.stop_rounded,          label: 'STOP', onTap: () => n.sendKeyPress(86)),
-                          _Btn(icon: Icons.skip_next_rounded,     label: 'NEXT', onTap: () => n.sendKeyPress(87)),
+          ui_anchor = """                _Btn(icon: Icons.skip_next_rounded,     label: 'NEXT', onTap: () => n.sendKeyPress(87)),
                         ],
                       ),
-                    ),
-          """
+                    ),"""
 
-          additions = """          _Label('MEDIA'),
-                    _Card(
-                      child: Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                        children: [
-                          _Btn(icon: Icons.skip_previous_rounded, label: 'PREV', onTap: () => n.sendKeyPress(88)),
-                          _Btn(icon: Icons.play_arrow_rounded,    label: 'PLAY', onTap: () => n.sendKeyPress(85)),
-                          _Btn(icon: Icons.stop_rounded,          label: 'STOP', onTap: () => n.sendKeyPress(86)),
-                          _Btn(icon: Icons.skip_next_rounded,     label: 'NEXT', onTap: () => n.sendKeyPress(87)),
-                        ],
-                      ),
-                    ),
+          ui_addition = """
                     const SizedBox(height: 20),
                     _Label('APPS'),
                     _Card(
@@ -166,10 +147,13 @@ jobs:
                           ),
                         ],
                       ),
-                    ),
-          """
+                    ),"""
 
-          patch("lib/src/ui/tv_remote_screen.dart", media, additions)
+          insert_after(
+              "lib/src/ui/tv_remote_screen.dart",
+              ui_anchor,
+              ui_addition
+          )
           PY
 
       - name: Install dependencies
