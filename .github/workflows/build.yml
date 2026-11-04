@@ -40,199 +40,94 @@ jobs:
           import sys
           from pathlib import Path
 
-          def replace_once(text, pattern, replacement, label, flags=re.M):
-              result, count = re.subn(
-                  pattern, lambda m: replacement,
-                  text, count=1, flags=flags
-              )
+          def insert_before(text, pattern, addition, label):
+              matches = list(re.finditer(pattern, text, re.M))
+              if len(matches) != 1:
+                  sys.exit(
+                      f"PATCH ERROR: {label}: found {len(matches)} matches"
+                  )
+              pos = matches[0].start()
+              return text[:pos] + addition + text[pos:]
+
+          def replace_once(text, old, new, label):
+              count = text.count(old)
               if count != 1:
-                  sys.exit(f"PATCH ERROR: {label}: found {count}")
-              return result
+                  sys.exit(
+                      f"PATCH ERROR: {label}: found {count} matches"
+                  )
+              return text.replace(old, new, 1)
 
-          files = {
-              "proto": Path("lib/src/proto/remote.pb.dart"),
-              "client": Path("lib/src/services/tv_remote_client.dart"),
-              "provider": Path("lib/src/providers/remote_provider.dart"),
-              "ui": Path("lib/src/ui/tv_remote_screen.dart"),
-          }
+          proto = Path("lib/src/proto/remote.pb.dart")
+          client = Path("lib/src/services/tv_remote_client.dart")
+          provider = Path("lib/src/providers/remote_provider.dart")
+          ui = Path("lib/src/ui/tv_remote_screen.dart")
 
-          src = {key: path.read_text() for key, path in files.items()}
+          p = proto.read_text()
+          c = client.read_text()
+          pr = provider.read_text()
+          u = ui.read_text()
 
-          # 1. Protocol: negotiate supported features
-
-          src["proto"] = replace_once(
-              src["proto"],
-              r"  static Uint8List buildConfigure\(\)\s*\{.*?\n  \}",
-              """  static Uint8List buildConfigure(int features) {
-              final deviceInfo = [
-                ..._strField(1, 'Flutter Remote'),
-                ..._strField(2, 'FlutterDev'),
-                ..._int32Field(3, 1),
-                ..._strField(4, '1'),
-                ..._strField(5, 'com.flutterremote'),
-                ..._strField(6, '1.0.0'),
-              ];
-              return frameMessage(
-                _bytesField(1, [
-                  ..._int32Field(1, features),
-                  ..._bytesField(2, deviceInfo),
-                ]),
-              );
-            }""",
-              "buildConfigure",
-              re.S,
+          # 1. Correct Android TV Remote feature flags.
+          p = replace_once(
+              p,
+              "_int32Field(1, 622)",
+              "_int32Field(1, 611)",
+              "Configure feature flags",
           )
 
-          src["proto"] = replace_once(
-              src["proto"],
-              r"  static Uint8List buildSetActive\(\)\s*=>.*?;",
-              """  static Uint8List buildSetActive(int features) =>
-              frameMessage(_bytesField(2, _int32Field(1, features)));""",
-              "buildSetActive",
-              re.S,
+          p = replace_once(
+              p,
+              "_int32Field(1, 622)",
+              "_int32Field(1, 611)",
+              "SetActive feature flags",
           )
 
-          # 2. Add the correct App Link message (field 90)
-
-          src["proto"] = replace_once(
-              src["proto"],
-              r"  /// Send a key event \(field 10 = remote_key_inject\)",
-              """  /// Launch an app using Android TV Remote App Link (field 90).
+          # 2. Add App Link launch message (RemoteMessage field 90).
+          p = insert_before(
+              p,
+              r"^[ \t]*/// Send a key event",
+              """  /// Launch an Android TV app using App Link.
             static Uint8List buildAppLinkLaunch(String appLink) =>
                 frameMessage(_bytesField(90, _strField(1, appLink)));
 
-            /// Send a key event (field 10 = remote_key_inject)""",
-              "App Link message",
+          """,
+              "App Link protocol method",
           )
 
-          # 3. Read the TV feature flags from RemoteConfigure
-
-          old_parse = """        if (field == 8) {
-                    // RemotePingRequest: parse val1 to echo back
-                    final pingVal = _firstVarintValue(data.sublist(i, i + len));
-                    i += len;
-                    return RemoteIncoming(field: 8, pingVal: pingVal);
-                  }
-                  i += len;
-                  return RemoteIncoming(field: field);"""
-
-          new_parse = """        if (field == 1) {
-                    // RemoteConfigure: code1 contains supported feature flags.
-                    final features = _firstVarintValue(data.sublist(i, i + len));
-                    i += len;
-                    return RemoteIncoming(
-                      field: 1,
-                      configureCode1: features,
-                    );
-                  }
-                  if (field == 8) {
-                    // RemotePingRequest: parse val1 to echo back.
-                    final pingVal = _firstVarintValue(data.sublist(i, i + len));
-                    i += len;
-                    return RemoteIncoming(field: 8, pingVal: pingVal);
-                  }
-                  i += len;
-                  return RemoteIncoming(field: field);"""
-
-          if old_parse not in src["proto"]:
-              sys.exit("PATCH ERROR: RemoteMessage.parse block not found")
-
-          src["proto"] = src["proto"].replace(old_parse, new_parse, 1)
-
-          src["proto"] = replace_once(
-              src["proto"],
-              r"class RemoteIncoming\s*\{.*?\n\}",
-              """class RemoteIncoming {
-              final int field;
-              final int pingVal;
-              final int configureCode1;
-
-              RemoteIncoming({
-                required this.field,
-                this.pingVal = 0,
-                this.configureCode1 = 0,
-              });
-            }""",
-              "RemoteIncoming",
-              re.S,
-          )
-
-          # 4. Client: intersect TV features with our supported features
-
-          src["client"] = replace_once(
-              src["client"],
-              r"  bool _isConnected = false;",
-              "  bool _isConnected = false;\n"
-              "  int _activeFeatures = 622;",
-              "client feature flags",
-          )
-
-          old_cases = """      case 1: // remoteConfigure – TV requests our device info, reply immediately
-                _commandSocket!.add(RemoteMessage.buildConfigure());
-                break;
-              case 2: // remoteSetActive
-                _commandSocket!.add(RemoteMessage.buildSetActive());
-                break;"""
-
-          new_cases = """      case 1: // remoteConfigure
-                _activeFeatures &= incoming.configureCode1;
-                _commandSocket!.add(
-                  RemoteMessage.buildConfigure(_activeFeatures),
-                );
-                break;
-              case 2: // remoteSetActive
-                _commandSocket!.add(
-                  RemoteMessage.buildSetActive(_activeFeatures),
-                );
-                break;"""
-
-          if old_cases not in src["client"]:
-              sys.exit("PATCH ERROR: client configure handlers not found")
-
-          src["client"] = src["client"].replace(old_cases, new_cases, 1)
-
-          # 5. Client: launch only when the TV supports APP_LINK (512)
-
-          src["client"] = replace_once(
-              src["client"],
+          # 3. Add launch method to the actual remote client.
+          c = insert_before(
+              c,
               r"^[ \t]*void sendKeyPress\(int code\)",
               """  void launchAppLink(String appLink) {
               if (!_isConnected || _commandSocket == null) return;
-
-              // APP_LINK = 2^9 = 512
-              if ((_activeFeatures & 512) == 0) {
-                return;
-              }
-
               try {
                 _commandSocket!.add(
                   RemoteMessage.buildAppLinkLaunch(appLink),
                 );
               } catch (e) {
-                _handleDisconnection('Failed to launch app link: $e');
+                _handleDisconnection('Failed to launch app: $e');
               }
             }
 
-            void sendKeyPress(int code)""",
+          """,
+              "Client sendKeyPress",
           )
 
-          # 6. Provider method
-
-          src["provider"] = replace_once(
-              src["provider"],
-              r"^[ \t]*void sendKeyPress\s*\(",
+          # 4. Add public method to provider.
+          pr = insert_before(
+              pr,
+              r"^[ \t]*void sendKeyPress\(int code\)",
               """  void launchAppLink(String appLink) =>
-                _remoteClient?.launchAppLink(appLink);
+              _remoteClient?.launchAppLink(appLink);
 
-            void sendKeyPress(""",
-              "provider launch method",
+          """,
+              "Provider sendKeyPress",
           )
 
-          # 7. Find the UI notifier
-
+          # 5. Find the actual UI notifier.
           matches = list(re.finditer(
               r"(\w+)\.sendKeyPress\s*\(",
-              src["ui"]
+              u
           ))
 
           if not matches:
@@ -254,7 +149,6 @@ jobs:
           ]
 
           buttons = ""
-
           for label, icon, package in apps:
               buttons += f"""
                   _Btn(
@@ -266,7 +160,7 @@ jobs:
                   ),
           """
 
-          ui_add = (
+          addition = (
               "          _Label('APPS'),\n"
               "          _Card(\n"
               "            child: Wrap(\n"
@@ -292,20 +186,22 @@ jobs:
               "          const SizedBox(height: 20),\n"
           )
 
-          src["ui"] = replace_once(
-              src["ui"],
-              r"^[ \t]*_Label\(\s*'MEDIA'\s*\)",
-              ui_add + "          _Label('MEDIA')",
-              "UI shortcuts",
+          u = insert_before(
+              u,
+              r"^[ \t]*_Label\('MEDIA'\)",
+              addition,
+              "UI MEDIA section",
           )
 
-          # Write only after all patches have succeeded.
+          # Write only after all checks pass.
+          proto.write_text(p)
+          client.write_text(c)
+          provider.write_text(pr)
+          ui.write_text(u)
 
-          for key, path in files.items():
-              path.write_text(src[key])
-
-          print("All patches applied successfully.")
-          print("App Link feature negotiation enabled.")
+          print("PATCH SUCCESS")
+          print("App Link method added.")
+          print("Feature flags set to 611.")
           print("UI notifier:", notifier)
           PY
 
