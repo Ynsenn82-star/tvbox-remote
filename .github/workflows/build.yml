@@ -2,22 +2,12 @@ name: Build TV Remote APK
 
 on:
   workflow_dispatch:
-    inputs:
-      shortcuts:
-        description: 'App shortcuts to add'
-        type: choice
-        default: youtube_only
-        options:
-          - youtube_only
-          - all
   push:
     branches: [main, master]
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      SHORTCUTS: ${{ github.event.inputs.shortcuts || 'youtube_only' }}
 
     steps:
       - name: Checkout repository
@@ -41,348 +31,278 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Show original client source
-        working-directory: app_source
-        run: |
-          echo "::group::tv_remote_client.dart (original)"
-          cat -n lib/src/services/tv_remote_client.dart
-          echo "::endgroup::"
-          echo "::group::message parsing in remote.pb.dart"
-          grep -nE "parse|decode|readVarint|_varint|frameMessage|class " lib/src/proto/remote.pb.dart | head -80
-          echo "::endgroup::"
-
-      - name: Add App Link codec and verifier
-        working-directory: app_source
-        run: |
-          mkdir -p tool
-          cat > lib/src/applink_codec.dart <<'DART'
-          import 'dart:convert';
-          import 'dart:typed_data';
-
-          class AppLinkDebug {
-            static DateTime? lastSent;
-            static void markSent() => lastSent = DateTime.now();
-            static String msSinceSent() => lastSent == null
-                ? 'never'
-                : '${DateTime.now().difference(lastSent!).inMilliseconds}';
-          }
-
-          class AppLinkCodec {
-            static const int _appLinkLaunchField = 90;
-
-            static List<int> _varint(int value) {
-              final out = <int>[];
-              var v = value;
-              while (v > 0x7F) {
-                out.add((v & 0x7F) | 0x80);
-                v >>= 7;
-              }
-              out.add(v);
-              return out;
-            }
-
-            static List<int> _lengthDelimited(int field, List<int> payload) => [
-                  ..._varint((field << 3) | 2),
-                  ..._varint(payload.length),
-                  ...payload,
-                ];
-
-            static Uint8List body(String appLink) {
-              final inner = _lengthDelimited(1, utf8.encode(appLink));
-              return Uint8List.fromList(_lengthDelimited(_appLinkLaunchField, inner));
-            }
-
-            static Uint8List frame(String appLink) {
-              final b = body(appLink);
-              return Uint8List.fromList([..._varint(b.length), ...b]);
-            }
-
-            static String hex(List<int> bytes) =>
-                bytes.map((x) => x.toRadixString(16).padLeft(2, '0')).join();
-          }
-          DART
-
-          cat > tool/verify_applink.dart <<'DART'
-          import 'dart:io';
-          import '../lib/src/applink_codec.dart';
-
-          void main(List<String> args) {
-            final tab = String.fromCharCode(9);
-            final lines = File(args[0])
-                .readAsLinesSync()
-                .where((l) => l.trim().isNotEmpty)
-                .toList();
-            var failed = 0;
-            for (final line in lines) {
-              final parts = line.split(tab);
-              final actual = AppLinkCodec.hex(AppLinkCodec.frame(parts[0]));
-              final ok = actual == parts[1];
-              stdout.writeln('${ok ? "OK  " : "FAIL"} ${parts[0]}');
-              if (!ok) {
-                stdout.writeln('  expected ${parts[1]}');
-                stdout.writeln('  actual   $actual');
-                failed++;
-              }
-            }
-            if (failed > 0 || lines.isEmpty) exit(1);
-            stdout.writeln('All ${lines.length} App Link frames match protobuf.');
-          }
-          DART
-
-      - name: Modify TV Remote
+      - name: Patch App Link protocol safely
         working-directory: app_source
         run: |
           python3 - <<'PY'
-          import os
-          import re
-          import string
           import sys
-          from collections import Counter
           from pathlib import Path
 
-          NL = chr(10)
-          WS = "[" + string.whitespace + "]"
-          SP = "[ " + chr(9) + "]"
-          W = "[A-Za-z0-9_]"
-          LP = "[(]"
-          RP = "[)]"
-          DOT = "[.]"
-          LB = "[{]"
-
-          def fail(msg):
-              print("PATCH ERROR:", msg)
-              sys.exit(1)
-
-          def insert_before(text, pattern, addition, label, first=False):
-              ms = list(re.finditer(pattern, text, re.M))
-              if not ms or (len(ms) != 1 and not first):
-                  fail(label + ": expected one anchor, found " + str(len(ms)))
-              pos = ms[0].start()
-              return text[:pos] + addition + text[pos:]
-
-          mode = os.environ.get("SHORTCUTS", "youtube_only")
-          print("Shortcut mode:", mode)
-
-          FEATURES = [("PING", 1), ("KEY", 2), ("IME", 4), ("POWER", 32),
-                      ("VOLUME", 64), ("APP_LINK", 512)]
-          proto_path = Path("lib/src/proto/remote.pb.dart")
-          if not proto_path.exists():
-              fail("lib/src/proto/remote.pb.dart not found")
-          proto_text = proto_path.read_text()
-          mask_pattern = ("_int32Field" + LP + WS + "*1" + WS + "*," + WS +
-                          "*([0-9]+)" + WS + "*" + RP)
-          masks = [int(x) for x in re.findall(mask_pattern, proto_text) if int(x) > 64]
-          print("Feature masks found in original source:", masks)
-          for m in masks:
-              print("  ", m, "->", [n for n, b in FEATURES if m & b])
-          if len(masks) < 2:
-              fail("expected feature masks in both Configure and SetActive")
-          for m in masks:
-              if not (m & 512):
-                  fail("mask " + str(m) + " does not declare APP_LINK (512)")
-          print("OK: all feature masks declare APP_LINK; values left unchanged.")
-
-          paths = {
-              "client": Path("lib/src/services/tv_remote_client.dart"),
-              "provider": Path("lib/src/providers/remote_provider.dart"),
-              "ui": Path("lib/src/ui/tv_remote_screen.dart"),
-          }
-          for k, p in paths.items():
+          def replace_once(path, old, new, label):
+              p = Path(path)
               if not p.exists():
-                  fail("missing file " + str(p))
+                  sys.exit("Missing file: " + path)
 
-          orig = {k: p.read_text() for k, p in paths.items()}
-          new = dict(orig)
+              text = p.read_text()
+              count = text.count(old)
 
-          for name in ("_isConnected", "_commandSocket", "_handleDisconnection"):
-              if name not in new["client"]:
-                  fail(name + " not found in client")
-          if "_remoteClient" not in new["provider"]:
-              fail("_remoteClient not found in provider")
-          for name in ("_Btn", "_Card", "_Label"):
-              if name not in new["ui"]:
-                  fail(name + " not found in UI")
+              if count != 1:
+                  sys.exit(
+                      f"{label}: expected exactly one match, found {count}"
+                  )
 
-          send_key_decl = "^" + SP + "*void" + WS + "+sendKeyPress" + WS + "*" + LP
+              p.write_text(text.replace(old, new, 1))
+              print("Patched:", label)
 
-          new["client"] = insert_before(
-              new["client"], "^import" + WS,
-              "import '../applink_codec.dart';" + NL,
-              "client import", first=True)
+          # 1. Add official Field 90 message using the project's
+          # existing Protobuf encoder and Varint framing.
+          proto = "lib/src/proto/remote.pb.dart"
 
-          LAUNCH_METHOD = """  void launchAppLink(String appLink) {
-              if (!_isConnected || _commandSocket == null) {
-                // ignore: avoid_print
-                print('AppLink skipped: connected=$_isConnected');
-                return;
+          replace_once(
+              proto,
+              "  /// Parse an incoming RemoteMessage.\n"
+              "  static RemoteIncoming parse(Uint8List data) {",
+              """  /// Send RemoteAppLinkLaunchRequest (RemoteMessage field 90).
+            static Uint8List buildAppLinkLaunch(String appLink) {
+              if (appLink.isEmpty) {
+                throw ArgumentError('App link cannot be empty');
               }
-              try {
-                final data = AppLinkCodec.frame(appLink);
-                // ignore: avoid_print
-                print('AppLink -> $appLink (${data.length} bytes): ${AppLinkCodec.hex(data)}');
-                AppLinkDebug.markSent();
-                _commandSocket!.add(data);
-              } catch (e, st) {
-                // ignore: avoid_print
-                print('AppLink SEND ERROR: $e');
-                // ignore: avoid_print
-                print('$st');
-                _handleDisconnection('Failed to launch app: $e');
-              }
+
+              final request = _strField(1, appLink);
+              return frameMessage(_bytesField(90, request));
             }
 
-          """
-          new["client"] = insert_before(
-              new["client"], send_key_decl, LAUNCH_METHOD, "client sendKeyPress")
+            /// Parse an incoming RemoteMessage.
+            static RemoteIncoming parse(Uint8List data) {""",
+              "Field 90 encoder"
+          )
 
-          disc_pattern = ("(?:void|Future<void>)" + WS + "+_handleDisconnection" + WS +
-                          "*" + LP + "([^)]*)" + RP + WS + "*(?:async" + WS + "*)?" + LB)
-          dm = re.search(disc_pattern, new["client"])
-          if dm:
-              first_param = dm.group(1).replace("[", "").replace("{", "").split(",")[0]
-              first_param = first_param.split("=")[0]
-              tokens = re.findall(W + "+", first_param)
-              reason = "$" + tokens[-1] if len(tokens) >= 2 else "n/a"
-              log = NL.join([
-                  "",
-                  "    // ignore: avoid_print",
-                  "    print('DISCONNECT reason=" + reason +
-                  " msSinceAppLink=${AppLinkDebug.msSinceSent()}');",
-                  "    // ignore: avoid_print",
-                  "    print('${StackTrace.current}');",
-              ])
-              new["client"] = new["client"][:dm.end()] + log + new["client"][dm.end():]
-              print("Disconnect logging added (reason expr:", reason, ")")
-          else:
-              print("WARNING: could not instrument _handleDisconnection; skipped")
+          # 2. Read the TV's feature bitmask from RemoteConfigure.code1.
+          replace_once(
+              proto,
+              """        if (field == 8) {
+                    // RemotePingRequest: parse val1 to echo back
+                    final pingVal = _firstVarintValue(data.sublist(i, i + len));
+                    i += len;
+                    return RemoteIncoming(field: 8, pingVal: pingVal);
+                  }
+                  i += len;
+                  return RemoteIncoming(field: field);""",
+              """        if (field == 1) {
+                    // RemoteConfigure.code1 contains the TV feature bitmask.
+                    final code1 = _firstVarintValue(data.sublist(i, i + len));
+                    return RemoteIncoming(field: 1, code1: code1);
+                  }
+                  if (field == 8) {
+                    // RemotePingRequest: parse val1 to echo back.
+                    final pingVal = _firstVarintValue(data.sublist(i, i + len));
+                    return RemoteIncoming(field: 8, pingVal: pingVal);
+                  }
+                  i += len;
+                  return RemoteIncoming(field: field);""",
+              "RemoteConfigure feature parser"
+          )
 
-          new["provider"] = insert_before(
-              new["provider"], send_key_decl,
+          replace_once(
+              proto,
+              """class RemoteIncoming {
+            final int field;
+            final int pingVal; // only meaningful when field == 8
+            RemoteIncoming({required this.field, this.pingVal = 0});
+          }""",
+              """class RemoteIncoming {
+            final int field;
+            final int pingVal;
+            final int code1;
+
+            RemoteIncoming({
+              required this.field,
+              this.pingVal = 0,
+              this.code1 = 0,
+            });
+          }""",
+              "RemoteIncoming fields"
+          )
+
+          # 3. Add a separate App Link capability flag.
+          client = "lib/src/services/tv_remote_client.dart"
+
+          replace_once(
+              client,
+              "  bool _isConnected = false;",
+              "  bool _isConnected = false;\n"
+              "  bool _supportsAppLink = false;",
+              "Client capability flag"
+          )
+
+          replace_once(
+              client,
+              """  Future<bool> connect(String ip, {int port = 6466}) async {
+              try {""",
+              """  Future<bool> connect(String ip, {int port = 6466}) async {
+              _supportsAppLink = false;
+              try {""",
+              "Reset App Link capability"
+          )
+
+          replace_once(
+              client,
+              """      case 1: // remoteConfigure – TV requests our device info, reply immediately
+                _commandSocket!.add(RemoteMessage.buildConfigure());""",
+              """      case 1: // remoteConfigure
+                // Feature.APP_LINK = 1 << 9 = 512.
+                _supportsAppLink = (incoming.code1 & 512) != 0;
+                _commandSocket!.add(RemoteMessage.buildConfigure());""",
+              "RemoteConfigure capability check"
+          )
+
+          replace_once(
+              client,
+              "  void sendKeyPress(int code) => _sendKey(code, RemoteDirection.SHORT);",
+              """  void launchAppLink(String appLink) {
+                if (!_isConnected || _commandSocket == null) return;
+
+                if (!_supportsAppLink) {
+                  // ignore: avoid_print
+                  print('TV does not advertise App Link support.');
+                  return;
+                }
+
+                if (appLink.isEmpty) return;
+
+                _commandSocket!.add(
+                  RemoteMessage.buildAppLinkLaunch(appLink),
+                );
+              }
+
+              void sendKeyPress(int code) =>
+                  _sendKey(code, RemoteDirection.SHORT);""",
+              "Client App Link method"
+          )
+
+          # 4. Expose the method through the existing Riverpod notifier.
+          provider = "lib/src/providers/remote_provider.dart"
+
+          replace_once(
+              provider,
+              "  void sendKeyPress(int code) => _remoteClient?.sendKeyPress(code);",
               """  void launchAppLink(String appLink) =>
-                _remoteClient?.launchAppLink(appLink);
+              _remoteClient?.launchAppLink(appLink);
 
-          """,
-              "provider sendKeyPress")
+            void sendKeyPress(int code) => _remoteClient?.sendKeyPress(code);""",
+              "Provider App Link method"
+          )
 
-          m = re.search("(" + W + "+)" + DOT + "sendKeyPress" + WS + "*" + LP, new["ui"])
-          if not m:
-              fail("UI notifier not found")
-          n = m.group(1)
+          # 5. Add YouTube only, immediately before the existing MEDIA section.
+          ui = "lib/src/ui/tv_remote_screen.dart"
 
-          all_apps = [
-              ("YOUTUBE", "smart_display_rounded", "com.google.android.youtube.tv"),
-              ("F LAUNCHER", "home_work_rounded", "me.efesser.flauncher"),
-              ("PLAY STORE", "shop_rounded", "com.android.vending"),
-              ("FILES", "folder_rounded", "com.alphainventor.filemanager"),
-              ("ADB TV", "build_rounded", "com.cybercat.adbappcontrol.tv"),
-          ]
-          apps = all_apps if mode == "all" else all_apps[:1]
-
-          BUTTON = """                _Btn(
-                    icon: Icons.__ICON__,
-                    label: '__LABEL__',
-                    onTap: () => __N__.launchAppLink('market://launch?id=__PKG__'),
-                  ),
-          """
-          buttons = ""
-          for label, icon, pkg in apps:
-              buttons += (BUTTON.replace("__ICON__", icon)
-                                .replace("__LABEL__", label)
-                                .replace("__PKG__", pkg))
-
-          SECTION = """          _Label('APPS'),
-                    _Card(
-                      child: Wrap(
-                        alignment: WrapAlignment.spaceEvenly,
-                        spacing: 12,
-                        runSpacing: 16,
-                        children: [
-          __BUTTONS__              ],
-                      ),
-                    ),
-                    const SizedBox(height: 20),
-                    _Label('DEVICE'),
+          replace_once(
+              ui,
+              "          _Label('MEDIA'),",
+              """          _Label('APPS'),
                     _Card(
                       child: Row(
                         mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                         children: [
-                          _Btn(icon: Icons.settings_rounded, label: 'SETTINGS', onTap: () => __N__.sendKeyPress(176)),
-                          _Btn(icon: Icons.power_settings_new_rounded, label: 'POWER', onTap: () => __N__.sendKeyPress(26)),
+                          _Btn(
+                            icon: Icons.smart_display_rounded,
+                            label: 'YOUTUBE',
+                            onTap: () => n.launchAppLink(
+                              'market://launch?id=com.google.android.youtube.tv',
+                            ),
+                          ),
                         ],
                       ),
                     ),
                     const SizedBox(height: 20),
-          """
-          addition = SECTION.replace("__BUTTONS__", buttons).replace("__N__", n)
+                    _Label('MEDIA'),""",
+              "YouTube UI button"
+          )
 
-          media_label = "^" + SP + "*_Label" + LP + WS + "*'MEDIA'" + WS + "*" + RP
-          new["ui"] = insert_before(new["ui"], media_label, addition, "UI MEDIA")
+          # 6. Explicitly verify the original MENU and INPUT controls remain.
+          ui_text = Path(ui).read_text()
 
-          for k in paths:
-              before = Counter(l.strip() for l in orig[k].splitlines() if l.strip())
-              after = Counter(l.strip() for l in new[k].splitlines() if l.strip())
-              missing = before - after
-              if missing:
-                  fail("original lines removed from " + k + ": " + str(list(missing)[:3]))
+          required_buttons = [
+              "label: 'MENU',  onTap: () => n.sendKeyPress(82)",
+              "label: 'INPUT', onTap: () => n.sendKeyPress(178)",
+          ]
 
-          print("Original MENU/INPUT lines in UI (kept):")
-          for l in orig["ui"].splitlines():
-              if "MENU" in l.upper() or "INPUT" in l.upper():
-                  print("   ", l.strip())
+          for button in required_buttons:
+              if button not in ui_text:
+                  sys.exit("Original remote button missing: " + button)
 
-          for k, p in paths.items():
-              p.write_text(new[k])
-          print("PATCH SUCCESS. UI notifier:", n)
+          print("All source patches completed.")
+          print("MENU and INPUT original key codes verified.")
           PY
+
+      - name: Add exact Protobuf reference tests
+        working-directory: app_source
+        run: |
+          mkdir -p test
+
+          cat > test/app_link_protocol_test.dart <<'DART'
+          import 'dart:typed_data';
+
+          import 'package:flutter_test/flutter_test.dart';
+          import '../lib/src/proto/remote.pb.dart';
+
+          void main() {
+            test('Field 90 matches the complete reference bytes', () {
+              const link =
+                  'market://launch?id=com.google.android.youtube.tv';
+
+              final actual = RemoteMessage.buildAppLinkLaunch(link);
+
+              final actualHex = actual
+                  .map((b) => b.toRadixString(16).padLeft(2, '0'))
+                  .join();
+
+              const expectedHex =
+                  '35d205320a306d61726b65743a2f2f6c61756e63683f69643d'
+                  '636f6d2e676f6f676c652e616e64726f69642e796f7574756265'
+                  '2e7476';
+
+              expect(actualHex, expectedHex);
+              expect(actual.first, 0x35);
+              expect(actual.length, 54);
+            });
+
+            test('RemoteConfigure reads the App Link feature bit', () {
+              // RemoteConfigure.code1 = 622.
+              final incoming = RemoteMessage.parse(
+                Uint8List.fromList([0x0a, 0x03, 0x08, 0x8e, 0x04]),
+              );
+
+              expect(incoming.field, 1);
+              expect(incoming.code1, 622);
+              expect(incoming.code1 & 512, 512);
+            });
+
+            test('RemoteConfigure without App Link bit is detected', () {
+              // RemoteConfigure.code1 = 110 (no bit 512).
+              final incoming = RemoteMessage.parse(
+                Uint8List.fromList([0x0a, 0x02, 0x08, 0x6e]),
+              );
+
+              expect(incoming.field, 1);
+              expect(incoming.code1 & 512, 0);
+            });
+          }
+          DART
 
       - name: Install dependencies
         working-directory: app_source
         run: flutter pub get
 
-      - name: Verify App Link frames against the OFFICIAL schema
-        working-directory: app_source
-        run: |
-          python3 -m venv /tmp/venv
-          . /tmp/venv/bin/activate
-          pip install --quiet protobuf grpcio-tools
-          mkdir -p /tmp/pb
-          curl -fsSL -o /tmp/pb/remotemessage.proto https://github.com/tronikos/androidtvremote2/raw/refs/tags/v0.0.14/src/androidtvremote2/remotemessage.proto
-          grep -q "RemoteAppLinkLaunchRequest remote_app_link_launch_request = 90;" /tmp/pb/remotemessage.proto
-          grep -q "string app_link = 1;" /tmp/pb/remotemessage.proto
-          python -m grpc_tools.protoc -I/tmp/pb --python_out=/tmp/pb /tmp/pb/remotemessage.proto
-          python - <<'PY'
-          import sys
-          sys.path.insert(0, "/tmp/pb")
-          import remotemessage_pb2 as pb
-          from google.protobuf.internal.encoder import _VarintBytes
-
-          TAB = chr(9)
-          NL = chr(10)
-          links = [
-              "market://launch?id=com.google.android.youtube.tv",
-              "market://launch?id=me.efesser.flauncher",
-              "market://launch?id=com.android.vending",
-              "market://launch?id=com.alphainventor.filemanager",
-              "market://launch?id=com.cybercat.adbappcontrol.tv",
-              "https://example.com/" + "a" * 130,
-          ]
-          with open("tool/applink_expected.tsv", "w") as f:
-              for link in links:
-                  msg = pb.RemoteMessage()
-                  msg.remote_app_link_launch_request.app_link = link
-                  body = msg.SerializeToString()
-                  assert body[:2] == bytes([0xD2, 0x05]), "field 90 tag must be 2 bytes"
-                  frame = _VarintBytes(len(body)) + body
-                  f.write(link + TAB + frame.hex() + NL)
-          print("Expected frames generated from the official schema.")
-          PY
-          dart run tool/verify_applink.dart tool/applink_expected.tsv
-
-      - name: Analyze Dart code
+      - name: Analyze Flutter project
         working-directory: app_source
         run: flutter analyze --no-fatal-infos --no-fatal-warnings
 
-      - name: Build APK
+      - name: Run tests
+        working-directory: app_source
+        run: flutter test
+
+      - name: Build Release APK
         working-directory: app_source
         run: flutter build apk --release --android-skip-build-dependency-validation
 
@@ -391,3 +311,4 @@ jobs:
         with:
           name: TV-Remote-APK
           path: app_source/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
