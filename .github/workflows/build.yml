@@ -30,61 +30,59 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK packages
-        run: |
-          sdkmanager "platforms;android-37.1" "build-tools;37.0.0"
-          yes | sdkmanager --licenses
+        with:
+          packages: 'platforms;android-37,build-tools;37.0.0'
 
       - name: Customize application
+        shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           root = Path("upstream")
+
           shortcut_file = root / "app/src/main/kotlin/dev/haris/atvremote/data/AppShortcut.kt"
           strings_file = root / "app/src/main/res/values/strings.xml"
 
           source = shortcut_file.read_text()
 
-          # Keep only the requested applications.
-          # Do not modify connection or reconnection code.
-          start = source.find("AppShortcut(\"YouTube\"")
-          if start == -1:
-              raise SystemExit("YouTube shortcut not found")
-
-          # Replace the existing shortcut list using the known list boundary.
-          import re
           pattern = re.compile(
-              r'(?ms)(AppShortcut\("YouTube".*?)(?=\n\s*\)\s*\n|\n\s*\]\s*\n)'
+              r'val DEFAULT_APP_SHORTCUTS: List<AppShortcut> = listOf\(.*?\n\)',
+              re.DOTALL
           )
 
-          match = pattern.search(source)
-          if not match:
-              raise SystemExit("Could not safely locate shortcut list")
+          shortcuts = '''val DEFAULT_APP_SHORTCUTS: List<AppShortcut> = listOf(
+              AppShortcut("YouTube", "https://www.youtube.com"),
+              AppShortcut("Google Play Store", "https://play.google.com/store/apps/details?id=com.android.vending"),
+              AppShortcut("File Manager", "https://play.google.com/store/apps/details?id=com.lonelycatgames.Xplore"),
+              AppShortcut("FLauncher", "https://play.google.com/store/apps/details?id=me.efesser.flauncher"),
+          )'''
 
-          shortcuts = '''AppShortcut("YouTube", "https://www.youtube.com",
-                  "https://play.google.com/store/apps/details?id=com.google.android.youtube.tv"),
-              AppShortcut("Google Play Store", "https://play.google.com/store/apps/details?id=com.android.vending",
-                  "https://play.google.com/store/apps/details?id=com.android.vending"),
-              AppShortcut("File Manager", "https://play.google.com/store/apps/details?id=com.deepakpk.tvexplorer",
-                  "https://play.google.com/store/apps/details?id=com.deepakpk.tvexplorer"),
-              AppShortcut("FLauncher", "https://play.google.com/store/apps/details?id=me.efesser.flauncher",
-                  "https://play.google.com/store/apps/details?id=me.efesser.flauncher")'''
+          updated, count = pattern.subn(
+              lambda match: shortcuts,
+              source,
+              count=1
+          )
 
-          updated = source[:match.start()] + shortcuts + source[match.end():]
+          if count != 1:
+              raise SystemExit("ERROR: Could not safely replace DEFAULT_APP_SHORTCUTS")
+
           shortcut_file.write_text(updated)
 
           strings = strings_file.read_text()
           strings = strings.replace("ATV Remote", "TV Remote Magic")
           strings_file.write_text(strings)
 
-          print("Customization completed")
-          print("Spotify removed")
-          print("Four requested shortcuts configured")
+          print("TV Remote Magic customization completed")
+          print("YouTube: enabled")
+          print("Google Play Store: enabled")
+          print("File Manager: enabled")
+          print("FLauncher: enabled")
+          print("Other default shortcuts removed")
           PY
 
-      - name: Build debug APK
+      - name: Build APK
         working-directory: upstream
         run: |
           chmod +x gradlew
