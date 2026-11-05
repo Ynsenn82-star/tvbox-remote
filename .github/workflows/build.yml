@@ -31,9 +31,12 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: |
-            platforms;android-37
-            build-tools;37.0.0
+          packages: 'platforms;android-37 build-tools;37.0.0'
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          sdkmanager "platforms;android-37" "build-tools;37.0.0"
 
       - name: Customize application
         shell: bash
@@ -93,6 +96,7 @@ jobs:
           ./gradlew --no-daemon :protocol:test :app:assembleDebug
 
       - name: Verify APK
+        shell: bash
         run: |
           APK="upstream/app/build/outputs/apk/debug/app-debug.apk"
           test -s "$APK"
