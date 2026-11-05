@@ -32,13 +32,19 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Android SDK
+      - name: Install Android SDK packages
         run: |
-          echo "ANDROID_HOME=$ANDROID_HOME"
           SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | sort | tail -n 1)"
-          test -x "$SDKMANAGER"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "sdkmanager not found"
+            exit 1
+          fi
+
           yes | "$SDKMANAGER" --licenses || true
-          "$SDKMANAGER" --install "platforms;android-37" "build-tools;37.0.0"
+
+          "$SDKMANAGER" \
+            "platforms;android-37.1" \
+            "build-tools;37.0.0"
 
       - name: Customize TV Remote Magic
         working-directory: app_source
@@ -48,9 +54,10 @@ jobs:
 
           root = Path("app/src/main")
 
-          # App shortcuts and Play Store fallback links
+          # App shortcuts
           shortcut = root / "kotlin/dev/haris/atvremote/data/AppShortcut.kt"
-          shortcut.write_text('''package dev.haris.atvremote.data
+
+          shortcut.write_text("""package dev.haris.atvremote.data
 
           data class AppShortcut(
               val label: String,
@@ -76,80 +83,90 @@ jobs:
               AppShortcut("JioHotstar", "https://www.hotstar.com",
                   "https://play.google.com/store/apps/details?id=in.startv.hotstar")
           )
-          ''', encoding="utf-8")
+          """, encoding="utf-8")
 
-          # Update ViewModel without changing connection or reconnect logic
+          # ViewModel: keep connection logic unchanged
           vm = root / "kotlin/dev/haris/atvremote/session/RemoteViewModel.kt"
           s = vm.read_text(encoding="utf-8")
 
           if "import dev.haris.atvremote.data.AppShortcut" not in s:
+              marker = "import dev.haris.atvremote.data.Identity"
+              if marker not in s:
+                  raise SystemExit("Cannot locate ViewModel imports")
               s = s.replace(
-                  "import dev.haris.atvremote.data.Identity",
-                  "import dev.haris.atvremote.data.AppShortcut\nimport dev.haris.atvremote.data.Identity"
+                  marker,
+                  "import dev.haris.atvremote.data.AppShortcut\n" + marker,
+                  1
               )
 
-          old = '''    fun launchApp(link: String) {
-              client?.let { active -> runCatching { active.launchApp(link) } }
-          }'''
+          old = """    fun launchApp(link: String) {
+                  client?.let { active -> runCatching { active.launchApp(link) } }
+              }"""
 
-          new = '''    fun launchApp(shortcut: AppShortcut) {
-              val active = client ?: return
-              runCatching {
-                  active.launchApp(shortcut.link)
-              }.onFailure { error ->
-                  Log.w(TAG, "App launch request failed; trying Play Store", error)
+          new = """    fun launchApp(shortcut: AppShortcut) {
+                  val active = client ?: return
+
                   runCatching {
-                      active.launchApp(shortcut.playStoreLink)
-                  }.onFailure { storeError ->
-                      Log.w(TAG, "Play Store request failed", storeError)
+                      active.launchApp(shortcut.link)
+                  }.onFailure { error ->
+                      Log.w(TAG, "App launch request failed; trying Play Store", error)
+                      runCatching {
+                          active.launchApp(shortcut.playStoreLink)
+                      }.onFailure { storeError ->
+                          Log.w(TAG, "Play Store request failed", storeError)
+                      }
                   }
               }
-          }
 
-          fun openPlayStore() {
-              val active = client ?: return
-              runCatching {
-                  active.launchApp("https://play.google.com/store/apps")
-              }.onFailure {
-                  Log.w(TAG, "Could not open Play Store", it)
-              }
-          }'''
+              fun openPlayStore() {
+                  val active = client ?: return
+                  runCatching {
+                      active.launchApp("https://play.google.com/store/apps")
+                  }.onFailure {
+                      Log.w(TAG, "Could not open Play Store", it)
+                  }
+              }"""
 
           if old not in s:
-              raise SystemExit("Could not find original launchApp function in RemoteViewModel.kt")
+              raise SystemExit("Cannot locate original launchApp function")
 
-          vm.write_text(s.replace(old, new), encoding="utf-8")
+          s = s.replace(old, new, 1)
+          vm.write_text(s, encoding="utf-8")
 
-          # Add Play Store button to Apps tab
+          # Apps screen
           screen = root / "kotlin/dev/haris/atvremote/ui/RemoteScreen.kt"
           s = screen.read_text(encoding="utf-8")
 
           if "import dev.haris.atvremote.data.AppShortcut" not in s:
+              marker = "import dev.haris.atvremote.data.DEFAULT_APP_SHORTCUTS"
+              if marker not in s:
+                  raise SystemExit("Cannot locate RemoteScreen imports")
               s = s.replace(
-                  "import dev.haris.atvremote.data.DEFAULT_APP_SHORTCUTS",
-                  "import dev.haris.atvremote.data.AppShortcut\nimport dev.haris.atvremote.data.DEFAULT_APP_SHORTCUTS"
+                  marker,
+                  "import dev.haris.atvremote.data.AppShortcut\n" + marker,
+                  1
               )
 
-          old_call = 'else -> AppsGrid(onLaunch = viewModel::launchApp)'
-          new_call = '''else -> AppsGrid(
+          old_call = "else -> AppsGrid(onLaunch = viewModel::launchApp)"
+          new_call = """else -> AppsGrid(
                           onLaunch = viewModel::launchApp,
                           onPlayStore = viewModel::openPlayStore
-                      )'''
+                      )"""
 
           if old_call not in s:
-              raise SystemExit("Could not find AppsGrid call in RemoteScreen.kt")
+              raise SystemExit("Cannot locate AppsGrid call")
 
-          s = s.replace(old_call, new_call)
+          s = s.replace(old_call, new_call, 1)
 
           start = s.find("@Composable\nprivate fun AppsGrid(")
           if start < 0:
-              raise SystemExit("Could not find AppsGrid function")
+              raise SystemExit("Cannot locate AppsGrid function")
 
           end = s.find("\n@Composable", start + 1)
           if end < 0:
-              raise SystemExit("Could not find end of AppsGrid function")
+              raise SystemExit("Cannot locate end of AppsGrid")
 
-          replacement = '''@Composable
+          replacement = """@Composable
           private fun AppsGrid(
               onLaunch: (AppShortcut) -> Unit,
               onPlayStore: () -> Unit
@@ -181,28 +198,32 @@ jobs:
                               onClick = { onLaunch(shortcut) },
                               modifier = Modifier.height(72.dp)
                           ) {
-                              Text(shortcut.label, textAlign = TextAlign.Center)
+                              Text(
+                                  shortcut.label,
+                                  textAlign = TextAlign.Center
+                              )
                           }
                       }
                   }
               }
           }
-          '''
+          """
 
           s = s[:start] + replacement + s[end:]
           screen.write_text(s, encoding="utf-8")
 
-          # Application name
+          # App name
           strings = root / "res/values/strings.xml"
           if strings.exists():
               s = strings.read_text(encoding="utf-8")
-              s = s.replace("TV Remote", "TV Remote Magic")
+              s = s.replace("<string name=\"app_name\">TV Remote</string>",
+                            "<string name=\"app_name\">TV Remote Magic</string>")
               strings.write_text(s, encoding="utf-8")
 
           print("TV Remote Magic customization completed.")
           PY
 
-      - name: Run protocol tests and build APK
+      - name: Run tests and build APK
         working-directory: app_source
         run: |
           chmod +x gradlew
