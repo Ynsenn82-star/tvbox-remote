@@ -31,7 +31,9 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: 'platforms;android-37,build-tools;37.0.0'
+          packages: |
+            platforms;android-37
+            build-tools;37.0.0
 
       - name: Customize application
         shell: bash
@@ -66,7 +68,9 @@ jobs:
           )
 
           if count != 1:
-              raise SystemExit("ERROR: Could not safely replace DEFAULT_APP_SHORTCUTS")
+              raise SystemExit(
+                  "ERROR: Could not safely replace DEFAULT_APP_SHORTCUTS"
+              )
 
           shortcut_file.write_text(updated)
 
