@@ -1,4 +1,5 @@
-name: Build Kotlin TV Remote APK
+
+name: Build TV Remote Magic APK
 
 on:
   workflow_dispatch:
@@ -11,51 +12,206 @@ permissions:
 
 jobs:
   build:
-    name: Build Android TV Remote
+    name: Build TV Remote Magic
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout this repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download Kotlin remote project
+      - name: Download Android remote project
         uses: actions/checkout@v4
         with:
           repository: theharisshah/androidremote
           ref: main
           path: app_source
 
-      - name: Install Java 17
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          packages: ''
-
-      - name: Install Android SDK packages
         run: |
-          yes | sdkmanager --licenses
-          sdkmanager "platforms;android-37.1" "build-tools;37.0.0"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | sort | tail -n 1)"
+          test -x "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses || true
+          "$SDKMANAGER" --install "platforms;android-37" "build-tools;37.0.0"
 
-      - name: Run protocol tests
+      - name: Customize TV Remote Magic
+        working-directory: app_source
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path("app/src/main")
+
+          # App shortcuts and Play Store fallback links
+          shortcut = root / "kotlin/dev/haris/atvremote/data/AppShortcut.kt"
+          shortcut.write_text('''package dev.haris.atvremote.data
+
+          data class AppShortcut(
+              val label: String,
+              val link: String,
+              val playStoreLink: String
+          )
+
+          val DEFAULT_APP_SHORTCUTS = listOf(
+              AppShortcut("YouTube", "https://www.youtube.com",
+                  "https://play.google.com/store/apps/details?id=com.google.android.youtube.tv"),
+              AppShortcut("Netflix", "https://www.netflix.com/title",
+                  "https://play.google.com/store/apps/details?id=com.netflix.ninja"),
+              AppShortcut("Prime Video", "https://app.primevideo.com",
+                  "https://play.google.com/store/apps/details?id=com.amazon.amazonvideo.livingroom"),
+              AppShortcut("Disney+", "https://www.disneyplus.com",
+                  "https://play.google.com/store/apps/details?id=com.disney.disneyplus"),
+              AppShortcut("Spotify", "spotify://",
+                  "https://play.google.com/store/apps/details?id=com.spotify.tv.android"),
+              AppShortcut("Plex", "plex://",
+                  "https://play.google.com/store/apps/details?id=com.plexapp.android"),
+              AppShortcut("HBO Max", "https://play.max.com",
+                  "https://play.google.com/store/apps/details?id=com.wbd.stream"),
+              AppShortcut("JioHotstar", "https://www.hotstar.com",
+                  "https://play.google.com/store/apps/details?id=in.startv.hotstar")
+          )
+          ''', encoding="utf-8")
+
+          # Update ViewModel without changing connection or reconnect logic
+          vm = root / "kotlin/dev/haris/atvremote/session/RemoteViewModel.kt"
+          s = vm.read_text(encoding="utf-8")
+
+          if "import dev.haris.atvremote.data.AppShortcut" not in s:
+              s = s.replace(
+                  "import dev.haris.atvremote.data.Identity",
+                  "import dev.haris.atvremote.data.AppShortcut\nimport dev.haris.atvremote.data.Identity"
+              )
+
+          old = '''    fun launchApp(link: String) {
+              client?.let { active -> runCatching { active.launchApp(link) } }
+          }'''
+
+          new = '''    fun launchApp(shortcut: AppShortcut) {
+              val active = client ?: return
+              runCatching {
+                  active.launchApp(shortcut.link)
+              }.onFailure { error ->
+                  Log.w(TAG, "App launch request failed; trying Play Store", error)
+                  runCatching {
+                      active.launchApp(shortcut.playStoreLink)
+                  }.onFailure { storeError ->
+                      Log.w(TAG, "Play Store request failed", storeError)
+                  }
+              }
+          }
+
+          fun openPlayStore() {
+              val active = client ?: return
+              runCatching {
+                  active.launchApp("https://play.google.com/store/apps")
+              }.onFailure {
+                  Log.w(TAG, "Could not open Play Store", it)
+              }
+          }'''
+
+          if old not in s:
+              raise SystemExit("Could not find original launchApp function in RemoteViewModel.kt")
+
+          vm.write_text(s.replace(old, new), encoding="utf-8")
+
+          # Add Play Store button to Apps tab
+          screen = root / "kotlin/dev/haris/atvremote/ui/RemoteScreen.kt"
+          s = screen.read_text(encoding="utf-8")
+
+          if "import dev.haris.atvremote.data.AppShortcut" not in s:
+              s = s.replace(
+                  "import dev.haris.atvremote.data.DEFAULT_APP_SHORTCUTS",
+                  "import dev.haris.atvremote.data.AppShortcut\nimport dev.haris.atvremote.data.DEFAULT_APP_SHORTCUTS"
+              )
+
+          old_call = 'else -> AppsGrid(onLaunch = viewModel::launchApp)'
+          new_call = '''else -> AppsGrid(
+                          onLaunch = viewModel::launchApp,
+                          onPlayStore = viewModel::openPlayStore
+                      )'''
+
+          if old_call not in s:
+              raise SystemExit("Could not find AppsGrid call in RemoteScreen.kt")
+
+          s = s.replace(old_call, new_call)
+
+          start = s.find("@Composable\nprivate fun AppsGrid(")
+          if start < 0:
+              raise SystemExit("Could not find AppsGrid function")
+
+          end = s.find("\n@Composable", start + 1)
+          if end < 0:
+              raise SystemExit("Could not find end of AppsGrid function")
+
+          replacement = '''@Composable
+          private fun AppsGrid(
+              onLaunch: (AppShortcut) -> Unit,
+              onPlayStore: () -> Unit
+          ) {
+              Column(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .padding(16.dp),
+                  verticalArrangement = Arrangement.spacedBy(12.dp)
+              ) {
+                  Button(
+                      onClick = onPlayStore,
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .height(54.dp)
+                  ) {
+                      Text("Google Play Store")
+                  }
+
+                  LazyVerticalGrid(
+                      columns = GridCells.Adaptive(minSize = 120.dp),
+                      contentPadding = PaddingValues(4.dp),
+                      horizontalArrangement = Arrangement.spacedBy(12.dp),
+                      verticalArrangement = Arrangement.spacedBy(12.dp),
+                      modifier = Modifier.weight(1f)
+                  ) {
+                      items(DEFAULT_APP_SHORTCUTS) { shortcut ->
+                          FilledTonalButton(
+                              onClick = { onLaunch(shortcut) },
+                              modifier = Modifier.height(72.dp)
+                          ) {
+                              Text(shortcut.label, textAlign = TextAlign.Center)
+                          }
+                      }
+                  }
+              }
+          }
+          '''
+
+          s = s[:start] + replacement + s[end:]
+          screen.write_text(s, encoding="utf-8")
+
+          # Application name
+          strings = root / "res/values/strings.xml"
+          if strings.exists():
+              s = strings.read_text(encoding="utf-8")
+              s = s.replace("TV Remote", "TV Remote Magic")
+              strings.write_text(s, encoding="utf-8")
+
+          print("TV Remote Magic customization completed.")
+          PY
+
+      - name: Run protocol tests and build APK
         working-directory: app_source
         run: |
           chmod +x gradlew
-          ./gradlew --no-daemon :protocol:test
-
-      - name: Build APK
-        working-directory: app_source
-        run: |
-          ./gradlew --no-daemon :app:assembleDebug
+          ./gradlew --no-daemon :protocol:test :app:assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Kotlin-TV-Remote-APK
+          name: TV-Remote-Magic-APK
           path: app_source/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
